@@ -5,14 +5,12 @@
   Purpose:
   - Create analytical views used by reporting queries and procedures
   - Keep logic reusable, readable, and consistent
-
-  Notes:
-  - vw_campaign_day_kpis includes ONLY days with traffic (sessions).
-    It is a deliberate reporting choice for this project.
 ============================================================================ */
 
-SET NOCOUNT ON;
-GO
+/* ============================================================================
+    Stage 2: vw_campaign_day_kpis updated to include clicks-based cost + CVR (sessions with >=1 conversion / sessions)
+   Note: click-driven daily view; direct sessions without click may be excluded.
+============================================================================*/
 
 /* ---------------------------------------------------------------------------
    View 1: vw_sessions_enriched
@@ -56,7 +54,8 @@ GO
    View 2: vw_campaign_day_kpis
    - Campaign-day KPIs (sessions, new/returning, conversions, revenue, cost)
    - Attribution note: revenue/conversions are aligned to the SESSION day
-   - IMPORTANT: This view returns only dates where sessions exist (traffic days)
+   - This view is click-driven (includes days with clicks). Sessions without 
+     associated clicks (direct) may be excluded
 --------------------------------------------------------------------------- */
 SET ANSI_NULLS ON;
 GO
@@ -81,61 +80,83 @@ WITH agg_sessions AS
 agg_conversions AS
 (
     SELECT
-        s.campaign_id,
-        CAST(s.session_datetime AS DATE) AS activity_date,
-        COUNT(DISTINCT cv.conversion_id) AS conversions,
-        SUM(cv.revenue) AS revenue
-    FROM marketing.sessions s
-    LEFT JOIN marketing.conversions cv
-        ON cv.session_id = s.session_id
+        cvi.campaign_id,
+        cvi.activity_date,
+        SUM(cvi.conversions) AS conversions,
+        COUNT(cvi.first_conversion) AS first_conversions, 
+        SUM(cvi.revenue) AS revenue
+    FROM
+    (
+        SELECT 
+            s.campaign_id,
+            s.session_id,
+            CAST(s.session_datetime AS DATE) AS activity_date,
+            COUNT(cv.conversion_id) AS conversions,
+            MIN(cv.conversion_id) AS first_conversion,
+            SUM(cv.revenue) AS revenue
+        FROM marketing.sessions s
+        LEFT JOIN marketing.conversions cv
+            ON cv.session_id = s.session_id
+        GROUP BY 
+            s.campaign_id,
+            s.session_id,
+            CAST(s.session_datetime AS DATE)
+    ) AS cvi
     GROUP BY
-        s.campaign_id,
-        CAST(s.session_datetime AS DATE)
+        cvi.campaign_id,
+        cvi.activity_date
 ),
-agg_costs AS
+agg_clicks AS
 (
     SELECT
-        cd.campaign_id,
-        cd.cost_date AS activity_date,
-        SUM(cd.cost) AS cost
-    FROM marketing.costs_daily cd
-    GROUP BY
-        cd.campaign_id,
-        cd.cost_date
+        cl.campaign_id,
+        CAST(cl.click_datetime AS DATE) AS activity_date,
+        COUNT(cl.click_id) AS clicks,
+        SUM(cl.cost) AS cost
+    FROM marketing.clicks cl
+    GROUP BY 
+        cl.campaign_id,
+        CAST(cl.click_datetime AS DATE)
+
 )
 SELECT
-    c.campaign_id,
+    cl.campaign_id,
     c.campaign_name,
     c.channel,
-    s.activity_date,
-    s.sessions,
-    s.new_user_sessions,
-    s.returning_sessions,
-
+    cl.activity_date,
+    ISNULL(s.sessions, 0) AS sessions,
+    ISNULL(s.new_user_sessions, 0) AS new_user_sessions,
+    ISNULL(s.returning_sessions, 0) AS returning_sessions,
+    ISNULL(cl.clicks, 0) AS clicks,
     ISNULL(cv.conversions, 0) AS conversions,
+    ISNULL(cv.first_conversions, 0) AS first_conversions,
     ISNULL(cv.revenue, 0) AS revenue,
-    ISNULL(co.cost, 0) AS cost,
+    ISNULL(cl.cost, 0) AS cost,
 
     /* rates */
     CAST(
         CAST(ISNULL(cv.conversions, 0) AS DECIMAL(10,2))
-        / NULLIF(CAST(s.sessions AS DECIMAL(10,2)), 0)
-        AS DECIMAL(10,2)
-    ) AS conversion_rate,
+        / NULLIF(CAST(ISNULL(s.sessions, 0) AS DECIMAL(10,2)), 0)
+    AS DECIMAL(10,2)) AS CPS,
+
+    CAST(
+        CAST(ISNULL(cv.first_conversions, 0) AS DECIMAL(10,2))
+        / NULLIF(CAST(ISNULL(s.sessions, 0) AS DECIMAL(10,2)), 0)
+    AS DECIMAL(10,2)) AS CVR,
 
     CAST(
         CAST(ISNULL(cv.revenue, 0) AS DECIMAL(10,2))
-        / NULLIF(CAST(ISNULL(co.cost, 0) AS DECIMAL(10,2)), 0)
-        AS DECIMAL(10,2)
-    ) AS ROAS
+        / NULLIF(CAST(ISNULL(cl.cost, 0) AS DECIMAL(10,2)), 0)
+    AS DECIMAL(10,2)) AS ROAS
 
-FROM agg_sessions s
+FROM agg_clicks cl
 JOIN marketing.campaigns c
-    ON c.campaign_id = s.campaign_id
+    ON c.campaign_id = cl.campaign_id
+LEFT JOIN agg_sessions s
+    ON s.campaign_id = cl.campaign_id
+   AND s.activity_date = cl.activity_date
 LEFT JOIN agg_conversions cv
-    ON cv.campaign_id = s.campaign_id
-   AND cv.activity_date = s.activity_date
-LEFT JOIN agg_costs co
-    ON co.campaign_id = s.campaign_id
-   AND co.activity_date = s.activity_date;
+    ON cv.campaign_id = cl.campaign_id
+   AND cv.activity_date = cl.activity_date;
 GO
+
