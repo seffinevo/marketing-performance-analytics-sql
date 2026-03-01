@@ -12,9 +12,6 @@
   - Upsert procedure uses TRY/CATCH, XACT_ABORT, and returns an audit log
 ============================================================================ */
 
-SET NOCOUNT ON;
-GO
-
 /* ---------------------------------------------------------------------------
    1) Campaign performance (range)
 --------------------------------------------------------------------------- */
@@ -40,23 +37,38 @@ BEGIN
     ;WITH sessions_conv AS
     (
         SELECT
-            s.campaign_id,
-            COUNT(DISTINCT s.session_id) AS sessions,
-            COUNT(DISTINCT cv.conversion_id) AS conversions,
-            SUM(cv.revenue) AS revenue
-        FROM marketing.sessions s
-        LEFT JOIN marketing.conversions cv
-            ON cv.session_id = s.session_id
-        WHERE CAST(s.session_datetime AS DATE) BETWEEN @start_date AND @end_date
-        GROUP BY s.campaign_id
+            sci.campaign_id,
+            COUNT(sci.session_id) AS sessions,
+            SUM(sci.conversions) AS conversions,
+            COUNT(sci.first_conversion) AS first_conversions,
+            SUM(sci.revenue) AS revenue
+        FROM (
+            SELECT
+                s.campaign_id,
+                s.session_id,
+                COUNT(cv.conversion_id) AS conversions,
+                MIN(cv.conversion_id) AS first_conversion,
+                SUM(cv.revenue) AS revenue,
+                CAST(s.session_datetime AS DATE) AS session_date
+            FROM marketing.sessions s
+            LEFT JOIN marketing.conversions cv
+                ON cv.session_id = s.session_id
+            GROUP BY 
+                s.campaign_id,
+                s.session_id,
+                CAST(s.session_datetime AS DATE)
+            ) AS sci
+        WHERE sci.session_date BETWEEN @start_date AND @end_date
+        GROUP BY sci.campaign_id
     ),
-    costs AS
+    clicks AS
     (
         SELECT
             campaign_id,
+            COUNT(click_id) AS clicks,
             SUM(cost) AS cost
-        FROM marketing.costs_daily
-        WHERE cost_date BETWEEN @start_date AND @end_date
+        FROM marketing.clicks
+        WHERE CAST(click_datetime AS DATE) BETWEEN @start_date AND @end_date
         GROUP BY campaign_id
     )
     SELECT
@@ -66,31 +78,39 @@ BEGIN
 
         ISNULL(sc.sessions, 0)     AS sessions,
         ISNULL(sc.conversions, 0)  AS conversions,
+        ISNULL(sc.first_conversions, 0) AS first_conversions,
+        ISNULL(cl.clicks, 0)       AS clicks,
         ISNULL(sc.revenue, 0)      AS revenue,
-        ISNULL(cd.cost, 0)         AS cost,
+        ISNULL(cl.cost, 0)         AS cost,
 
-        /* conversion_rate: if sessions=0 => 0 */
+        /* CPS: if sessions=0 => 0 */
         CAST(
             ISNULL(
                 CAST(ISNULL(sc.conversions, 0) AS DECIMAL(10,2))
-                / NULLIF(CAST(ISNULL(sc.sessions, 0) AS DECIMAL(10,2)), 0),
-            0)
+                / NULLIF(CAST(ISNULL(sc.sessions, 0) AS DECIMAL(10,2)), 0), 0)
             AS DECIMAL(10,2)
-        ) AS conversion_rate,
+        ) AS CPS,
+
+        /* CVR: if sessions=0 => 0 */
+        CAST(
+            ISNULL(
+                CAST(ISNULL(sc.first_conversions, 0) AS DECIMAL(10,2))
+                / NULLIF(CAST(ISNULL(sc.sessions, 0) AS DECIMAL(10,2)), 0), 0)
+            AS DECIMAL(10,2)
+        ) AS CVR,
 
         /* ROAS: if cost=0 => 0 (project choice for cleaner demo output) */
         CAST(
             ISNULL(
                 CAST(ISNULL(sc.revenue, 0) AS DECIMAL(10,2))
-                / NULLIF(CAST(ISNULL(cd.cost, 0) AS DECIMAL(10,2)), 0),
-            0)
+                / NULLIF(CAST(ISNULL(cl.cost, 0) AS DECIMAL(10,2)), 0), 0)
             AS DECIMAL(10,2)
         ) AS ROAS
     FROM marketing.campaigns c
+    LEFT JOIN clicks cl
+        ON c.campaign_id = cl.campaign_id
     LEFT JOIN sessions_conv sc
         ON c.campaign_id = sc.campaign_id
-    LEFT JOIN costs cd
-        ON c.campaign_id = cd.campaign_id
     ORDER BY
         ISNULL(sc.revenue, 0) DESC,
         ISNULL(sc.sessions, 0) DESC;
@@ -120,7 +140,9 @@ BEGIN
     IF @start_date > @end_date
         THROW 50021, 'start_date cannot be after end_date', 1;
 
-    /* Date grid (within the chosen range) */
+    /* ------------------------------------------------------------------------
+       Date grid (within the chosen range)
+    ------------------------------------------------------------------------ */
     DECLARE @dates TABLE ([date] DATE NOT NULL PRIMARY KEY);
 
     DECLARE @d DATE = @start_date;
@@ -130,7 +152,9 @@ BEGIN
         SET @d = DATEADD(DAY, 1, @d);
     END;
 
-    /* Campaign x Date grid */
+    /* ------------------------------------------------------------------------
+       Campaign x Date grid
+    ------------------------------------------------------------------------ */
     DECLARE @campaigns_dates TABLE
     (
         campaign_id   INT          NOT NULL,
@@ -148,46 +172,83 @@ BEGIN
     FROM marketing.campaigns c
     CROSS JOIN @dates d;
 
+    /* ------------------------------------------------------------------------
+       Aggregations (CTEs) for clean joins
+       - sessions + revenue aligned to session_date
+       - clicks + cost aligned to click_date
+    ------------------------------------------------------------------------ */
+    ;WITH agg_clicks AS
+    (
+        SELECT
+            cl.campaign_id,
+            CAST(cl.click_datetime AS DATE) AS activity_date,
+            COUNT(*) AS clicks,
+            SUM(cl.cost) AS cost
+        FROM marketing.clicks cl
+        GROUP BY
+            cl.campaign_id,
+            CAST(cl.click_datetime AS DATE)
+    )
     SELECT
         cdg.campaign_id,
         cdg.campaign_name,
         cdg.channel,
         cdg.[date],
 
-        COUNT(DISTINCT s.session_id)        AS sessions,
-        COUNT(DISTINCT cv.conversion_id)    AS conversions,
-        ISNULL(SUM(cv.revenue), 0)          AS revenue,
-        ISNULL(SUM(costs.cost), 0)          AS cost,
+        /* volume */
+        COUNT(DISTINCT s.session_id)                 AS sessions,
+        ISNULL(clk.clicks, 0)                        AS clicks,
+        COUNT(DISTINCT cv.conversion_id)             AS conversions,
+        ISNULL(SUM(cv.revenue), 0)                   AS revenue,
+        ISNULL(clk.cost, 0)                          AS cost,
 
+        /* CPS = total conversions / total sessions */
         CAST(
             ISNULL(
                 CAST(COUNT(DISTINCT cv.conversion_id) AS DECIMAL(10,2))
                 / NULLIF(CAST(COUNT(DISTINCT s.session_id) AS DECIMAL(10,2)), 0),
-            0)
-            AS DECIMAL(10,2)
-        ) AS conversion_rate,
+                0
+            )
+        AS DECIMAL(10,2)) AS CPS,
 
+        /* CVR = sessions with at least one conversion / total sessions */
+        CAST(
+            ISNULL(
+                CAST(
+                    COUNT(DISTINCT CASE WHEN cv.conversion_id IS NOT NULL THEN s.session_id END)
+                    AS DECIMAL(10,2)
+                )
+                / NULLIF(CAST(COUNT(DISTINCT s.session_id) AS DECIMAL(10,2)), 0),
+                0
+            )
+        AS DECIMAL(10,2)) AS CVR,
+
+        /* ROAS = revenue / cost */
         CAST(
             ISNULL(
                 CAST(ISNULL(SUM(cv.revenue), 0) AS DECIMAL(10,2))
-                / NULLIF(CAST(ISNULL(SUM(costs.cost), 0) AS DECIMAL(10,2)), 0),
-            0)
-            AS DECIMAL(10,2)
-        ) AS ROAS
+                / NULLIF(CAST(ISNULL(clk.cost, 0) AS DECIMAL(10,2)), 0),
+                0
+            )
+        AS DECIMAL(10,2)) AS ROAS
+
     FROM @campaigns_dates cdg
     LEFT JOIN marketing.sessions s
         ON s.campaign_id = cdg.campaign_id
        AND CAST(s.session_datetime AS DATE) = cdg.[date]
     LEFT JOIN marketing.conversions cv
         ON cv.session_id = s.session_id
-    LEFT JOIN marketing.costs_daily costs
-        ON costs.campaign_id = cdg.campaign_id
-       AND costs.cost_date = cdg.[date]
+    LEFT JOIN agg_clicks clk
+        ON clk.campaign_id  = cdg.campaign_id
+       AND clk.activity_date = cdg.[date]
+
     GROUP BY
         cdg.campaign_id,
         cdg.campaign_name,
         cdg.channel,
-        cdg.[date]
+        cdg.[date],
+        clk.clicks,
+        clk.cost
     ORDER BY
         cdg.campaign_id,
         cdg.[date];
