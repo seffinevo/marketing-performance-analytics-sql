@@ -1,104 +1,148 @@
-# Marketing Performance Analytics – SQL Server Project
+# Marketing Performance Analytics (SQL Server)
 
 ## Project Overview
-This project simulates a digital marketing analytics system built in SQL Server.
-It enables analysis of marketing performance across campaigns, including traffic, conversions, revenue attribution, marketing spend, and user behavior (new vs returning users).
+This project simulates a marketing analytics database in SQL Server, enabling analysis of campaign performance across clicks, sessions, conversions, revenue, and spend.  
+It is built as an interview-ready portfolio project: clean schema, reproducible seed data, analytical views, stored procedures, and a runnable demo query pack.
 
-The project is designed end-to-end: from data modeling and constraints, through reproducible seed data, to business-focused analytical views, stored procedures, and demo queries.
+## What This Demonstrates
+- Relational modeling + constraints (schemas, PK/FK, identity)
+- Analytics logic (joins, aggregation, window functions)
+- KPI design with safe division patterns (NULLIF)
+- Reusable analytical layer (views + stored procedures)
+- Cohort thinking (D0 / D7 / D30 windows) for insight stories
 
-## Goals
-- Build an interview-ready SQL portfolio project beyond “course level”
-- Demonstrate data modeling, KPI aggregation, and robust SQL patterns (joins, window functions, safe division, upsert)
-- Provide an easy-to-run repo with reproducible outputs
+---
 
-## Repo Structure
-- 01_tables.sql – create schema + tables + constraints
-- 02_seed_data.sql – insert seed data (safe to re-run)
-- 03_views.sql – create analytical views
-- 04_procedures.sql – create stored procedures
-- 05_queries_demo.sql – demo queries (validation + examples)
+## Repo Structure (SQL)
+**Core (Stage 2 – current)**
+- `01_tables.sql` – creates schema + core tables (marketing.*)
+- `06_schema_clicks.sql` – adds/updates schema objects required for the clicks model (Stage 2)
+- `07_seed_clicks_and_more_data.sql` – Stage 2 seed data (clicks + sessions + conversions + realistic conversion lag)
+- `03_views.sql` – analytical views:
+  - `vw_sessions_enriched`
+  - `vw_campaign_day_kpis` (Stage 2: click-driven daily KPIs)
+- `04_procedures.sql` – stored procedures:
+  - `sp_campaign_performance`
+  - `sp_campaign_day_performance`
+  - `sp_upsert_costs_daily` (kept as daily spend upsert example)
+- `08_views_cohorts.sql` – cohort views:
+  - `vw_click_cohort_cvr_d0_d7_d30`
+  - `vw_click_cohort_device_cvr_d0_d7_d30`
+- `05_queries_demo.sql` – demo query pack (includes “Insight Story” + “Cohort Analysis” sections)
 
-## Data Model (schema: marketing)
+**Legacy / Scratch**
+- `02_seed_data.sql` – legacy Stage 1 seed (not part of the Stage 2 run order)
+- `SQLQuery1.sql`, `SQLQuery2.sql` – drafts; best kept under `sql/scratch/` (optional)
+
+---
+
+## Data Model (schema: `marketing`)
 ### Tables
-- marketing.campaigns – marketing campaigns (name, channel, start_date)
-- marketing.users – users (first_seen_date, optional registration_date, country, gender)
-- marketing.sessions – sessions (FKs to users + campaigns, device, landing_page, session_datetime)
-- marketing.conversions – conversions (FK to sessions, conversion_datetime, conversion_type, revenue)
-- marketing.costs_daily – daily spend per campaign (composite PK: cost_date + campaign_id)
+- `marketing.campaigns` – campaigns (campaign_name, channel, start_date)
+- `marketing.users` – users (first_seen_date, optional registration_date, country, gender)
+- `marketing.clicks` – click events (campaign_id, click_datetime, cost)
+- `marketing.sessions` – sessions (user_id, campaign_id, click_id, device, landing_page, session_datetime)
+- `marketing.conversions` – conversions (session_id, conversion_datetime, conversion_type, revenue)
+- `marketing.costs_daily` – daily spend per campaign (cost_date + campaign_id composite PK)
 
-Key relationships:
-- One campaign → many sessions
-- One user → many sessions
-- One session → zero or more conversions
-- One campaign + date → one cost record
+### Key Relationships
+- campaign → many clicks / sessions  
+- click → zero-or-one session (some orphan clicks exist by design in seed data)  
+- user → many sessions  
+- session → zero-or-many conversions  
+- costs_daily is maintained as a campaign-day “source of truth” example (via MERGE upsert)
+
+---
+
+## KPI Definitions (Stage 2)
+- **CPS** = total conversions / total sessions  
+- **CVR (GA4-style)** = sessions with ≥ 1 conversion / total sessions  
+  - Implemented by counting each session once if it has at least one conversion.
+- **ROAS** = revenue / cost  
+  - Stage 2 daily views/procedures use **click-based cost** (`SUM(clicks.cost)`).
+
+### Attribution Choice (Daily Reporting)
+Daily outcomes (conversions/revenue) are aligned to the **session day** (`session_date`), not to `conversion_datetime`.
+
+---
 
 ## Analytical Layer
 ### Views
-- marketing.vw_sessions_enriched
-  - Adds session sequencing per user (rn_user_session) and an is_new_user_session flag using ROW_NUMBER()
+- `marketing.vw_sessions_enriched`
+  - Adds `session_date`
+  - Adds `rn_user_session` and `is_new_user_session` based on `ROW_NUMBER()` over user history
 
-- marketing.vw_campaign_day_kpis
-  - Daily KPI aggregation per campaign:
-    - sessions, new vs returning sessions
-    - conversions, revenue
-    - cost, conversion_rate, ROAS
-  - Important note: this view intentionally includes only days with traffic (sessions).
-    Days with cost but no sessions are not included (by design). For a full campaign×date grid, use marketing.sp_campaign_day_performance.
+- `marketing.vw_campaign_day_kpis` (Stage 2)
+  - Daily campaign KPIs: clicks, sessions, new vs returning sessions, conversions, first_conversions, revenue, cost, CPS, CVR, ROAS
+  - **Click-driven**: built from click-days; sessions/conversions joined by matching activity date
 
 ### Stored Procedures
-- marketing.sp_campaign_performance(@start_date, @end_date)
+- `marketing.sp_campaign_performance(@start_date, @end_date)`
   - Campaign-level KPIs for a date range (returns campaigns even with 0 activity)
+  - Includes clicks, sessions, conversions, first_conversions, revenue, cost, CPS, CVR, ROAS
 
-- marketing.sp_campaign_day_performance(@start_date, @end_date)
-  - Campaign-day KPIs using a campaign × date grid for the requested range (includes zero-activity days)
+- `marketing.sp_campaign_day_performance(@start_date, @end_date)`
+  - Campaign × date grid for the requested range
+  - Joins sessions/conversions by session_date; joins clicks by click_date
+  - Includes clicks, sessions, conversions, first_conversions, revenue, cost, CPS, CVR, ROAS
 
-- marketing.sp_upsert_costs_daily(@cost_date, @campaign_id, @cost)
-  - Upsert daily cost into marketing.costs_daily (insert/update)
+- `marketing.sp_upsert_costs_daily(@cost_date, @campaign_id, @cost)`
+  - Upserts daily cost into `marketing.costs_daily` and returns an audit log
+  - Included as an example of controlled ingestion via MERGE
 
-## Business Questions Answered
-- How much traffic does each campaign generate?
-- How many conversions and how much revenue does each campaign produce?
-- What is the conversion rate per campaign?
-- What is the ROAS (Return on Ad Spend) by campaign and by day?
-- How many sessions come from new users vs returning users over time?
-- What are the top revenue days per campaign and how do conversion types differ?
+---
 
-## How to Run
+## Cohort Analysis (Stage 2)
+### Cohort Views
+- `marketing.vw_click_cohort_cvr_d0_d7_d30`
+  - Cohort granularity: `campaign_id + cohort_date`
+  - Cohort = click cohort by calendar date: `cohort_date = CAST(click_datetime AS DATE)`
+  - Windows: D0 / D7 / D30 (calendar-day windows)
+  - Measures “converted sessions” in GA4-style (session counted once if it has ≥ 1 conversion)
+
+- `marketing.vw_click_cohort_device_cvr_d0_d7_d30`
+  - Same cohort logic, segmented by `device`
+  - **Sessions-only** by design (excludes orphan clicks), because device is a session dimension
+
+### Note on Cohort Windows
+Cohort windows are currently **calendar-day based** (cohort_date), not timestamp-accurate windows based on `click_datetime`.  
+This can be upgraded later if needed.
+
+---
+
+## Notes / Known Limitations (Stage 2)
+- `vw_campaign_day_kpis` is click-driven: it includes days with clicks, and joins session-based metrics by `session_date`.  
+  As a result, sessions that have no associated click (e.g., direct traffic) may be excluded from the daily view.  
+  (Acceptable for this demo dataset; can be addressed later with a date grid / activity calendar.)
+
+---
+
+## How to Run (Stage 2)
 Run scripts in this order:
-1) 01_tables.sql
-2) 02_seed_data.sql
-3) 03_views.sql
-4) 04_procedures.sql
-5) 05_queries_demo.sql
 
-## Design Decisions
-- Costs at campaign-day level (marketing.costs_daily)
-  - Matches common ad platform reporting granularity.
+1. `01_tables.sql`
+2. `06_schema_clicks.sql`
+3. `07_seed_clicks_and_more_data.sql`
+4. `03_views.sql`
+5. `04_procedures.sql`
+6. `08_views_cohorts.sql`
+7. `05_queries_demo.sql`
 
-- Daily attribution aligns revenue to session_date (not conversion_datetime)
-  - In daily reporting, outcomes are aligned to the day the session happened, so traffic+cost vs outcome are comparable on the same day.
-
-- New vs Returning definition is global
-  - “New user session” is the user’s first-ever session in the dataset, not “new within the selected date range”.
-
-- marketing.vw_campaign_day_kpis includes only traffic days
-  - The view returns only dates where sessions exist (by design). For “full grid” reporting use marketing.sp_campaign_day_performance.
-
-- Safe division patterns
-  - Calculations use safe division patterns (NULLIF) to avoid divide-by-zero issues.
-
-## Notes / Known Limitations (Stage 1)
-- The seed script (02_seed_data.sql) is safe to re-run because it deletes existing rows (child → parent) and inserts data again.
-- Date grid logic is implemented inside a stored procedure. Stage 2 improvement: replace this with a dedicated Calendar/Date dimension table.
+---
 
 ## Quick Demo
-After running all scripts, you can:
-- Query marketing.vw_campaign_day_kpis for daily KPIs
-- Run:
-  - EXEC marketing.sp_campaign_performance '2024-02-10', '2024-02-22';
-  - EXEC marketing.sp_campaign_day_performance '2024-02-10', '2024-02-22';
-- Use 05_queries_demo.sql to see example analysis queries (window functions, top days, breakdown by conversion type, etc.)
+- Daily KPIs:
+  - `SELECT TOP (50) * FROM marketing.vw_campaign_day_kpis ORDER BY activity_date DESC, campaign_id;`
+- Campaign KPIs (range):
+  - `EXEC marketing.sp_campaign_performance '2024-02-01','2024-03-31';`
+- Campaign-day KPIs (range):
+  - `EXEC marketing.sp_campaign_day_performance '2024-02-01','2024-03-31';`
+- Cohorts:
+  - `SELECT TOP (50) * FROM marketing.vw_click_cohort_cvr_d0_d7_d30 ORDER BY campaign_id, cohort_date;`
+  - `SELECT TOP (50) * FROM marketing.vw_click_cohort_device_cvr_d0_d7_d30 ORDER BY campaign_id, cohort_date, device;`
 
-## Technologies
+---
+
+## Tech Stack
 - SQL Server
-- T-SQL (tables, constraints, views, stored procedures, analytical queries)
+- T-SQL (tables, constraints, views, stored procedures, window functions)
